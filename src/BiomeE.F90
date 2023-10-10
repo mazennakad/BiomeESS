@@ -42,8 +42,7 @@
 !     Soil water dynamics: soil surface evaporation, infiltration, runoff
 !
 !----------------------------- END ----------------------------------
-
-!#define DemographyOFF
+!#define UFL_Monoculture
 
 !---------------
 module BiomeE_mod
@@ -106,11 +105,6 @@ subroutine BiomeE_initialization()
   totdays   = INT(totyears/yr_data+1)*days_data
   equi_days = Max(0, totdays - days_data)
 
-  ! Set up scenarios for rainfall and CO2 concentration
-  forcingData%rain = forcingData%rain * Sc_prcp
-  forcingData%CO2  = CO2_c * 1.0e-6
-  !stop
-
   ! ------ Soil and PFT parameters ------
   call initialize_soilpars()
   call initialize_PFT_data()
@@ -139,7 +133,6 @@ subroutine BiomeE_initialization()
   enddo
   vegn => land%firstVegn
   pveg => NULL()
-  write(*,*)'total tiles:', N_VegTile
 
   ! --------- Setup output files ---------------
   call set_up_output_files(fno1,fno2,fno3,fno4,fno5,fno6)
@@ -154,32 +147,40 @@ subroutine BiomeE_run()
   ! Weng 08/08/2022, for model run
   implicit none
   type(vegn_tile_type), pointer :: vegn => NULL()
-  integer :: i, idays, idata, idoy
+  type(climate_data_type) :: climateData ! for UFL_test
+  integer :: i, k, idays, idata, idoy
   integer :: n_steps, n_yr, year0, year1
   real    :: r_d
   logical :: new_annual_cycle
 
   !----------------------
-  year0   = forcingData(1)%year
   n_yr    = 1
   idoy    = 0
-  n_steps = 0
-  do idays =1, totdays ! 1*days_data ! days for the model run
+  n_steps = StartLine - 1 ! steps skipped acc. the starting line, for UFL only
+  do idays =1, totdays - (StartLine - 1)/steps_per_day ! 1*days_data ! days for the model run
     idoy = idoy + 1
     land%Tc_daily = 0.0 ! Zero daily mean temperature
-
     ! Fast-step update (hourly or half-hourly)
     do i=1,steps_per_day
       n_steps = n_steps + 1
       idata = MOD(n_steps-1, datalines) + 1
-      year0 = forcingData(idata)%year  ! Current step year
-      land%Tc_daily = land%Tc_daily + forcingData(idata)%Tair
+      climateData = forcingData(idata)
+
+      ! Set up scenarios for rainfall and CO2 concentration
+      climateData%rain = forcingData(idata)%rain * Sc_prcp
+      climateData%CO2  = CO2_c * 1.0e-6
+#ifdef UFL_Monoculture
+      if(n_yr > 500)then
+        climateData%rain = 0.5 * forcingData(idata)%rain * Sc_prcp
+      endif
+#endif
+      land%Tc_daily = land%Tc_daily + climateData%Tair - 273.16
+
       vegn => land%firstVegn
       do while(ASSOCIATED(vegn))
-        call vegn_CNW_budget_fast(vegn,forcingData(idata))
-        call hourly_diagnostics(vegn,forcingData(idata), &
+        call vegn_CNW_budget_fast(vegn,climateData)
+        call hourly_diagnostics(vegn,climateData, &
                                 n_yr,idoy,i,idays,fno1,fno2)
-
         vegn => vegn%next
       enddo
     enddo ! steps_per_day
@@ -188,19 +189,18 @@ subroutine BiomeE_run()
     ! Daily update
     vegn => land%firstVegn
     do while(ASSOCIATED(vegn))
-      call daily_diagnostics(vegn,n_yr,idoy,idays,fno3,fno4)
       vegn%Tc_daily = land%Tc_daily
       call vegn_daily_update(vegn,dt_daily_yr)
-
+      call daily_diagnostics(vegn,n_yr,idoy,idays,fno3,fno4)
       vegn => vegn%next
     enddo
 
-    !! Check if the next step is a new year
+    ! Annual update
+    ! Check if the next step is a new year
+    year0 = forcingData(idata)%year  ! Current step year
     idata = MOD(n_steps, datalines) + 1
     year1 = forcingData(idata)%year  ! Nex step year
     new_annual_cycle = ((year0 /= year1) .OR. (MOD(n_steps,datalines)==0))
-
-    ! Annual update
     if(new_annual_cycle)then
       idoy = 0
       vegn => land%firstVegn
@@ -208,28 +208,49 @@ subroutine BiomeE_run()
         ! Update plant hydraulic states, for the last year
         call vegn_hydraulic_states(vegn,real(seconds_per_year))
         call annual_diagnostics(vegn,n_yr,fno5,fno6)
+        call vegn_demographics(vegn,real(seconds_per_year))
 
         ! Case studies
         ! N is losing after changing the soil pool structure. Hack !!!!!
-        ! if(do_closedN_run) call Recover_N_balance(vegn)
+        if(do_closedN_run) call Recover_N_balance(vegn)
         ! if(do_fire) call vegn_fire (vegn, real(seconds_per_year))
         if(do_migration) call vegn_migration(vegn) ! for competition
         ! if(update_annualLAImax) call vegn_annualLAImax_update(vegn)
 
-        call vegn_demographics_annual(vegn,real(seconds_per_year))
-
-        ! zero annual reporting variables
+        ! Cohort management
+        call kill_lowdensity_cohorts(vegn)
+        ! calculate the number of cohorts with indivs>mindensity
+         k = 0
+         do i = 1, vegn%n_cohorts
+            if (vegn%cohorts(i)%nindivs > 0.5*min_nindivs) k=k+1
+         enddo
+         if(k==0)then
+           write(*,*)"zero cohorts, reset!"
+           call reset_vegn_initial(vegn)
+         endif
+         call kill_old_grass(vegn)
+         !call vegn_gap_fraction_update(vegn) !for CROWN_GAP_FILLING
+         call relayer_cohorts(vegn)
+         call vegn_mergecohorts(vegn)
+        ! Summarize tile and zero annual reporting variables
+        call vegn_sum_tile(vegn)
         call Zero_diagnostics(vegn)
 
+#ifdef DBEN_runs
         !! Reset vegetation to initial conditions, for DBEN
         CALL RANDOM_NUMBER(r_d)
         if((n_yr==yr_ResetVeg).or.(n_yr>yr_ResetVeg .and. r_d<envi_fire_prb)) &
           call reset_vegn_initial(vegn)
+#endif
         vegn => vegn%next
       enddo
 
       ! update the years of model run
       n_yr = n_yr + 1
+
+#ifdef UFL_Monoculture
+      if(n_yr > 505)exit
+#endif
     endif
   enddo
 end subroutine BiomeE_run

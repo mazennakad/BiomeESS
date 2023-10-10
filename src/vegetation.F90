@@ -1,3 +1,5 @@
+!#define GrowthOFF
+!#define DemographyOFF
 !---------------
 module esdvm
  use datatypes
@@ -7,9 +9,11 @@ module esdvm
  private
 
  !Core functions
- public :: initialize_vegn_tile
- public :: vegn_CNW_budget_fast,vegn_daily_update, vegn_demographics_annual
- public :: relayer_cohorts, vegn_hydraulic_states
+ public :: initialize_vegn_tile,vegn_sum_tile
+ public :: vegn_phenology
+ public :: vegn_CNW_budget_fast,vegn_daily_update, vegn_demographics
+ public :: relayer_cohorts, vegn_hydraulic_states, vegn_SW2HW_hydro
+ public :: kill_lowdensity_cohorts,kill_old_grass,vegn_mergecohorts
 
  !For specific experiments
  public :: vegn_fire, vegn_migration, vegn_species_switch, Recover_N_balance
@@ -54,6 +58,9 @@ subroutine vegn_CNW_budget_fast(vegn, forcing)
   call Plant_water_dynamics_linear(vegn)
   ! Photosynsthesis
   call vegn_photosynthesis(forcing, vegn)
+
+  ! Phloem transport, Mazen Nakad, 10/08/2023
+  call vegn_Phloem_transport(forcing,vegn)
 #else
   ! Water supply from soil directly
   call SoilWaterSupply(vegn)
@@ -89,7 +96,7 @@ subroutine vegn_daily_update(vegn, deltat)
 end subroutine vegn_daily_update
 
 !==========================================================================
-subroutine vegn_demographics_annual(vegn, deltat)
+subroutine vegn_demographics(vegn, deltat)
   type(vegn_tile_type), intent(inout) :: vegn
   real, intent(in) :: deltat ! seconds of a year
   !-------- local vars ----------
@@ -105,17 +112,10 @@ subroutine vegn_demographics_annual(vegn, deltat)
   call vegn_nat_mortality(vegn, deltat)
   call vegn_reproduction(vegn)
 #endif
-  ! Cohort management
-  call kill_lowdensity_cohorts(vegn)
-  call kill_old_grass(vegn)
-  !call vegn_gap_fraction_update(vegn) !for CROWN_GAP_FILLING
-  call relayer_cohorts(vegn)
-  call vegn_mergecohorts(vegn)
-  call vegn_sum_tile(vegn)
 
   !call check_N_conservation(vegn,totalN1,'annual')
 
-end subroutine vegn_demographics_annual
+end subroutine vegn_demographics
 
 !=============== Plant physiology =======================================
 !=============== Hourly subroutines =====================================
@@ -134,10 +134,11 @@ subroutine vegn_photosynthesis (forcing, vegn)
   real :: cana_co2 ! co2 concentration in canopy air space, mol CO2/mol dry air
   real :: p_surf   ! surface pressure, Pa
   real :: water_supply ! water supply per m2 of leaves
+  real :: water_demand
   real :: fw, fs ! wet and snow-covered fraction of leaves
   real :: psyn   ! net photosynthesis, mol C/(m2 of leaves s)
   real :: resp   ! leaf respiration, mol C/(m2 of leaves s)
-  real :: tempLAI,w_scale2, transp ! mol H20 per m2 of leaf per second
+  real :: tempLAI,wd, transp ! mol H20 per m2 of leaf per second
   real :: kappa  ! light extinction coefficient of corwn layers
   real :: f_light(10)=0.0      ! light fraction of each layer
   integer :: i, layer
@@ -181,18 +182,22 @@ subroutine vegn_photosynthesis (forcing, vegn)
          call gs_Leuning(rad_top, rad_net, TairK, cana_q, cc%lai, &
                          p_surf, water_supply, cc%species, sp%pt, &
                          cana_co2, cc%extinct, fs+fw, cc%layer,   &
-                         psyn, resp,w_scale2,transp ) ! output
+                         psyn,resp,wd,transp ) ! output
          ! put into cohort data structure for future use in growth
          cc%An_op  = psyn  ! molC s-1 m-2 of leaves
          cc%An_cl  = -resp  ! molC s-1 m-2 of leaves
-         cc%w_scale  = w_scale2
-         cc%transp = transp * mol_h2o * cc%Aleaf * step_seconds  ! Transpiration (kgH2O/(tree step), Weng, 2017-10-16
-         cc%gpp  = (psyn-resp) * mol_C * cc%Aleaf * step_seconds ! kgC step-1 tree-1
+         cc%w_scale= transp/wd
+         cc%transp = transp      * mol_h2o * cc%Aleaf * step_seconds ! Transpiration (kgH2O/(tree step), Weng, 2017-10-16
+         cc%gpp    = (psyn-resp) * mol_C   * cc%Aleaf * step_seconds ! kgC step-1 tree-1
+
+         ! For UFL drought mortality
+         Water_demand = wd * mol_h2o * cc%Aleaf * step_seconds ! Potential transp, kgH2O/(tree step)
+         cc%totDemand = cc%totDemand + Water_demand
 
          !if(isnan(cc%gpp))cc%gpp=0.0
          if(isnan(cc%gpp))stop '"gpp" is a NaN'
          if(isnan(cc%transp))then
-            write(*,*)'w_scale2,transp,lai',w_scale2,transp,cc%lai
+            write(*,*)'wd,transp,lai',wd,transp,cc%lai
             stop '"transp" is a NaN'
          endif
        else
@@ -210,7 +215,7 @@ end subroutine vegn_photosynthesis
 !============================================================================
 subroutine gs_Leuning(rad_top, rad_net, tl, ea, lai, &
                    p_surf, ws, pft, pt, ca, kappa, f_w, layer, &
-                   apot, acl,w_scale2, transp)
+                   apot, acl,wd, transp)
   real,    intent(in)   :: rad_top ! PAR dn on top of the canopy, w/m2
   real,    intent(in)   :: rad_net ! PAR net on top of the canopy, w/m2
   real,    intent(in)   :: tl   ! leaf temperature, degK
@@ -230,7 +235,7 @@ subroutine gs_Leuning(rad_top, rad_net, tl, ea, lai, &
   !real,    intent(out)   :: gs   ! stomatal conductance, m/s
   real,    intent(out)   :: apot ! net photosynthesis, mol C/(m2 s)
   real,    intent(out)   :: acl  ! leaf respiration, mol C/(m2 s)
-  real,    intent(out)   :: w_scale2,transp  ! transpiration, mol H20/(m2 of leaf s)
+  real,    intent(out)   :: wd,transp  ! transpiration, mol H20/(m2 of leaf s)
 
   ! ---- local vars
   ! photosynthesis
@@ -271,7 +276,7 @@ subroutine gs_Leuning(rad_top, rad_net, tl, ea, lai, &
 
   b=0.01
   do1=0.09 ! kg/kg
-  if (pft < 2) do1=0.15
+  !if (pft < 2) do1=0.15 ! Commented out by Weng, 09/24/2023
 
   ! Convert Solar influx from W/(m^2s) to mol_of_quanta/(m^2s) PAR,
   ! empirical relationship from McCree is light=rn*0.0000046
@@ -354,7 +359,7 @@ subroutine gs_Leuning(rad_top, rad_net, tl, ea, lai, &
              Ag=(Ag_l+Ag_rb)/ &
                ((1.0+exp(0.4*(5.0-tl+TFREEZE))) &
                *(1.0+exp(0.4*(tl-45.0-TFREEZE))))
-             An=Ag-Resp
+             An=Ag-Resp ! Resp includes all LAI. Weng, 09/24/2023
              anbar=An/lai
 
              if(anbar>0.0) then
@@ -415,13 +420,11 @@ subroutine gs_Leuning(rad_top, rad_net, tl, ea, lai, &
   apot = an_w
   acl  = -Resp/lai
   transp = min(ws,Ed) ! mol H20/(m2 of leaf s)
+  wd = Ed
 
   ! Convert units of stomatal conductance to m/s from mol/(m2 s) by
   ! multiplying it by a volume of a mole of gas
   gs = gs * Rgas * Tl / p_surf
-
-  ! for reporting
-  w_scale2=min(1.0,ws/Ed)
 
   ! Error check
   if(isnan(transp))then
@@ -563,8 +566,8 @@ subroutine vegn_respiration(forcing,vegn)
        !  tfs = thermal_inhibition(tsoil)  ! original
        tfs = tf ! Rm_T_response_function(tsoil) ! Weng 2014-01-14
        ! With nitrogen model, leaf respiration is a function of leaf nitrogen
-       NSCtarget = 0.5 * (cc%bl_max + cc%br_max)
-       fnsc = min(max(0.0,cc%nsc/NSCtarget),1.0)
+       NSCtarget = 3. * (cc%bl_max + cc%br_max)
+       fnsc = min(max(0.0,cc%nsc/NSCtarget-0.05),1.0)
        Acambium = PI * cc%DBH * cc%height * 1.2
 
        ! r_leaf = fnsc*sp%gamma_LN  * cc%leafN * tf * dt_fast_yr  ! tree-1 step-1
@@ -588,6 +591,7 @@ subroutine vegn_respiration(forcing,vegn)
        cc%resl = r_leaf + r_stem ! tree-1 step-1
        cc%resr = r_root + r_Nfix ! tree-1 step-1
        cc%resp = cc%resl + cc%resr + cc%resg/steps_per_day   !kgC tree-1 step-1
+       cc%resp = min(cc%resp,max(0.0,cc%nsc+cc%gpp-cc%resp)) ! Hack, Weng 09/24/2023
        cc%npp  = cc%gpp  - cc%resp ! kgC tree-1 step-1
 
        ! Update NSC and NSN
@@ -673,10 +677,6 @@ subroutine vegn_growth(vegn)
   real :: r_N_SD
   integer :: i,j,k
 
-  ! Turnover of leaves and fine roots
-  call vegn_tissue_turnover(vegn)
-  call SoilWater_psi_K(vegn)
-
   !Allocate C_gain to tissues
   do i = 1, vegn%n_cohorts
     cc => vegn%cohorts(i)
@@ -684,8 +684,6 @@ subroutine vegn_growth(vegn)
     ! Skip non-growing season
     if(cc%status == LEAF_OFF) cycle
 
-    ! Update leaf age
-    cc%leafage = cc%leafage + 1.0/365.0
     ! Get carbon from NSC pool
     call fetch_CN_for_growth(cc,Cgrowth,Ngrowth) ! Weng, 2017-10-19
     associate (sp => spdata(cc%species))
@@ -745,15 +743,16 @@ subroutine vegn_growth(vegn)
            dSeed=  Nsupplyratio * dSeed
         endif
       endif
-
+      cc%NSC   = cc%NSC   - dBR - dBL -dSeed - dBSW
+      cc%resg  = 0.5 * (dBR+dBL+dSeed+dBSW) !  daily
+#ifndef GrowthOFF
       !update biomass pools
       cc%bl    = cc%bl    + dBL
       cc%br    = cc%br    + dBR
       cc%bsw   = cc%bsw   + dBSW
       cc%seedC = cc%seedC + dSeed
-      cc%NSC   = cc%NSC   - dBR - dBL -dSeed - dBSW
-      cc%leafage = (1.0 - dBL/cc%bl) * cc%leafage
-      cc%resg  = 0.5 * (dBR+dBL+dSeed+dBSW) !  daily
+      ! Update leaf age
+      cc%leafage = (1.0 - dBL/cc%bl)*cc%leafage + 1.0/365.0
 
       !!update nitrogen pools, Nitrogen allocation
       cc%leafN = cc%leafN + dBL   /sp%CNleaf0
@@ -779,7 +778,7 @@ subroutine vegn_growth(vegn)
       call update_max_LFR_NSN(cc)
 
       ! Update plant hydraulic states
-      call Update_hydraulic_vars(cc)
+      call Update_cohort_vars(cc)
       call Plant_water2psi_exp(cc)
       if(cc%firstday)then
         cc%psi_s0   = maxval(vegn%psi_soil(:))
@@ -792,10 +791,15 @@ subroutine vegn_growth(vegn)
       cc%Lring(k)= HT2Lpath(cc%height)
       cc%Ktrunk  = cc%Ktrunk+ &
             0.25*PI*(cc%DBH**2-DBH0**2)*cc%Kx(k)/cc%Lring(k)
-
+#endif
     end associate ! F2003
   enddo
   cc => null()
+#ifndef GrowthOFF
+  ! Turnover of leaves and fine roots
+  call vegn_tissue_turnover(vegn)
+  call SoilWater_psi_K(vegn)
+#endif
 end subroutine vegn_growth ! daily
 
 !========= Calculate carbon and nitrogen supply ==========================
@@ -829,8 +833,8 @@ subroutine fetch_CN_for_growth(cc,Cgrowth,Ngrowth)
         N_pull = LFR_rate * (Max(cc%bl_max - cc%bl,0.0)/sp%CNleaf0 +  &
                   Max(cc%br_max - cc%br,0.0)/sp%CNroot0)
 
-        C_push = cc%nsc/(days_per_year*sp%tauNSC) ! max(cc%nsc-NSCtarget, 0.0)/(days_per_year*sp%tauNSC)
-        N_push = cc%NSN/(days_per_year*sp%tauNSC)
+        C_push = max(0.0,cc%nsc-0.1*NSCtarget)/(days_per_year*sp%tauNSC) ! max(cc%nsc-NSCtarget, 0.0)/(days_per_year*sp%tauNSC)
+        N_push = max(0.0,cc%NSN)/(days_per_year*sp%tauNSC)
 
         Cgrowth = Min(max(0.02*cc%NSC,0.0), C_pull + C_push)
         Ngrowth = Min(max(0.02*cc%NSN,0.0), N_pull + N_push)
@@ -864,7 +868,9 @@ subroutine update_max_LFR_NSN(cc)
       BL_u = BL_c / (1+cc%layer)            ! Woody plants only
     endif
     cc%bl_max = BL_u + min(1., cc%topyear/sp%transT) * (BL_c - BL_u)
-
+#ifdef UFL_test
+    if(cc%layer > 1) cc%bl_max = sp%LMA * 1.0 * cc%Acrown * (1.0-sp%f_cGap)
+#endif
     ! Root max
     cc%br_max = BLmax2BRmax(cc)
     ! NSN max
@@ -889,7 +895,7 @@ subroutine vegn_phenology(vegn) ! daily step
 
   ! -------------- update vegn GDD and tc_pheno ---------------
   ! environmental factors for each cohort
-  vegn%tc_pheno = vegn%tc_pheno * 0.8 + vegn%Tc_daily * 0.2 ! K
+  vegn%tc_pheno = vegn%tc_pheno * 0.8 + vegn%Tc_daily * 0.2 ! C
   do i = 1, vegn%n_cohorts
     cc=>vegn%cohorts(i)
     associate (sp => spdata(cc%species) )
@@ -918,7 +924,8 @@ subroutine vegn_phenology(vegn) ! daily step
       gdd_ON = sp%gdd_par1 + sp%gdd_par2 * exp(sp%gdd_par3*cc%ncd)
 
       PhenoON = ((sp%phenotype==0 .and. cc%status/=LEAF_ON)         &
-        .and.(cc%gdd>sp%gdd_crit .and. vegn%tc_pheno>sp%tc_crit_on) &  ! Thermal conditions
+        !.and.(cc%gdd>sp%gdd_crit .and. vegn%tc_pheno>sp%tc_crit_on) &  ! Thermal conditions
+        .and.(cc%gdd > gdd_ON    .and. vegn%tc_pheno>sp%tc_crit_on) &  ! Thermal conditions
         .and.(vegn%thetaS>sp%betaON .and. cc%Ndm>Days_thld)         &  ! Water
         .and.(.NOT.(sp%lifeform==0 .and. cc%layer > GrassMaxL))     &  ! If grasses, layer< 3
          )
@@ -1079,6 +1086,7 @@ subroutine vegn_daily_starvation (vegn)
     if (cc%nsc < 0.01*cc%bl_max )then ! .OR. cc%NSN < 0.01*cc%bl_max/sp%CNleaf0
          deathrate = 1.0
          deadtrees = cc%nindivs * deathrate !individuals / m2
+         write(*,*)"Daily starvation is happening"
          ! Carbon and Nitrogen from plants to soil pools
          call plant2soil(vegn,cc,deadtrees)
          ! update cohort individuals
@@ -1395,7 +1403,7 @@ subroutine setup_seedling(cc,totC,totN)
      cc%Atrunk  = cc%Aring(1)
 
      ! Cohort hydraulic properties
-     call Update_hydraulic_vars(cc)
+     call Update_cohort_vars(cc)
      cc%W_leaf = cc%Wmax_l
      cc%W_stem = cc%Wmax_s
      cc%W_dead = 0.0
@@ -1435,6 +1443,7 @@ subroutine vegn_nat_mortality (vegn, deltat)
      cc => vegn%cohorts(i)
 
      cc%mu = mortality_rate(cc)
+     if(cc%mu>=0.9) write(*,*)"Bulk motality happens!!!",cc%species,i
      !deadtrees = cc%nindivs*(1.0-exp(0.0-cc%mu*deltat/seconds_per_year)) ! individuals / m2
      deadtrees = cc%nindivs * cc%mu * deltat/seconds_per_year ! individuals / m2
      ! Carbon and Nitrogen from dead plants to soil pools
@@ -1464,9 +1473,10 @@ subroutine vegn_annual_starvation (vegn)
        deathrate = 0.0
        !if (cc%bsw<0 .or. cc%nsc < 0.00001*cc%bl_max .OR.(cc%layer >1 .and. sp%lifeform ==0)) then
        !if (cc%nsc < 0.01*cc%bl_max .OR. cc%annualNPP < 0.0) then ! .OR. cc%NSN < 0.01*cc%bl_max/sp%CNleaf0
-       if (cc%nsc < 0.01*cc%bl_max .OR. cc%annualNPP < 0.0) then ! annualNPP < 0 is for grasses only
+       if (cc%nsc < 0.01*cc%bl_max) then !  .OR. cc%annualNPP < 0.0, annualNPP < 0 is for grasses only
            deathrate = 1.0
            deadtrees = cc%nindivs * deathrate !individuals / m2
+           write(*,*)"Yearly starvation: cNo., PFT:",i,cc%species
            ! Carbon and Nitrogen from plants to soil pools
            call plant2soil(vegn,cc,deadtrees)
            ! update cohort individuals
@@ -1520,29 +1530,24 @@ real function mortality_rate(cc) result(mu) ! per year
   ! conditions. Here, we only used used a couple of parameters to calculate
   ! mortality as functions of social status, seedling size, and adult size.
   ! Grass is saprately defined.
-  type(cohort_type),intent(in) :: cc
+  type(cohort_type),intent(inout) :: cc
 
   !-------local var -------------
   integer :: n ! the latest ring
   real :: f_L, f_S, f_D ! Layer, seeding, and size effects on mortality
-  real :: expD, m_S ! Mortality multiplier for size effects
   real :: mu_bg    = 0.0  ! Background mortality rate
   real :: mu_hydro = 0.0  ! Hydraulic failure
 
   !---------------------
   associate ( sp => spdata(cc%species))
     n = MIN(cc%Nrings, Ysw_max)
-    f_L  = sp%A_un * SQRT(Max(0.0, cc%layer - 1.0)) ! Layer effects (0~ infinite)
-    f_S  = sp%A_sd * exp(sp%B_sd*cc%dbh) + 1.0      ! Understory seedling
-
-    ! Size effect on the mortality of adult trees
-    if(do_U_shaped_mortality)then
-       m_S = 5.0
-    else
-       m_S = 0.0
-    endif
-    expD = exp(sp%A_D * (cc%dbh - sp%D0mu))
-    f_D  = 1. + m_S * expD / (1. + expD) ! Size effects (big tees)
+    f_L = sp%A_un * SQRT(Max(0.0, cc%layer-1.0)) ! Layer effects (0~ infinite)
+    f_S = sp%A_sd * exp(sp%B_sd*cc%dbh) + 1.0    ! Understory seedling
+    f_D = 1.0
+    ! Size effects (adult trees only)
+    if(do_U_shaped_mortality) &
+       f_D  = 1. + sp%A_DBH/(1.+exp((sp%D0mu-cc%dbh)/sp%B_DBH)) ! Size effects (big tees)
+    ! Background mortality rate
     mu_bg = Min(0.5,sp%r0mort_c * (1.d0+f_L*f_S)*f_D) ! per year
 
 #ifdef Hydro_test
@@ -1554,16 +1559,20 @@ real function mortality_rate(cc) result(mu) ! per year
 
   end associate
   ! Return mortality rate:
+#ifdef UFL_test
+  cc%w_scale = cc%annualTrsp/cc%totDemand
+  mu = mu_bg + (0.5 - mu_bg)/(1+exp(-20.0*(1.0-cc%w_scale) + alphaDrought))
+#else
   mu = mu_bg + mu_hydro - mu_bg * mu_hydro ! Add hydraulic failure
+#endif
 
 end function mortality_rate
 
 !============================================================================
 !-----------------------Plant Hydraulics------------------------------
 subroutine vegn_hydraulic_states(vegn, deltat)
-  ! Update plant hydraulic states and coverstion of sapwood to heartwood
-  ! yearly time step
-  ! Author: Ensheng Weng, 2021-03-15, updated 2021-12-8
+  ! Update plant hydraulic states, yearly time step
+  ! Author: Ensheng Weng, 2021-03-15, updated 2023-10-8
   type(vegn_tile_type), intent(inout) :: vegn
   real, intent(in) :: deltat ! seconds since last mortality calculations, s
 
@@ -1589,39 +1598,42 @@ subroutine vegn_hydraulic_states(vegn, deltat)
           cc%Lring(1) = HT2Lpath(cc%height)
           cc%Aring(1) = PI * cc%Rring(1)**2
        endif
-       ! Set up the space for the new ring : moving previous years' states inward
-       if(cc%Nrings >= Ysw_max)then
-          do j=2, Ysw_max
-             cc%WTC0(j-1)  = cc%WTC0(j)
-             cc%Kx(j-1)    = cc%Kx(j)
-             cc%farea(j-1) = cc%farea(j)
-             cc%accH(j-1)  = cc%accH(j)
-             cc%plcH(j-1)  = cc%plcH(j)
-             cc%Rring(j-1) = cc%Rring(j)
-             cc%Lring(j-1) = cc%Lring(j)
-             cc%Aring(j-1) = cc%Aring(j)
-          enddo
-       endif
 
-       ! Growth: the new ring formed in this year
-       cc%Nrings = cc%Nrings + 1 ! A new ring
-       k = MIN(cc%Nrings, Ysw_max)
-       ! WTC0 and Kx represent scientific hypotheses. They can be constant,
-       ! or functions of environmental conditions, growht rates, etc.
-       cc%WTC0(k) = NewWoodWTC(cc)
-       cc%Kx(k)   = NewWoodKx(cc)
-       ! Other cohort variables of the new ring
-       cc%farea(k) = 1.0
-       cc%accH(k)  = 0.0
-       cc%plcH(k)  = 0.0
-       cc%Rring(k) = cc%DBH/2.0
-       cc%Lring(k) = HT2Lpath(cc%height)
-       if(k>1)then
-          cc%Aring(k) = PI * Max(0.0,cc%Rring(k)**2 - (cc%DBH_ys/2.)**2)
-       else
-          cc%Aring(k) = PI * cc%Rring(k)**2 ! Only for the first year
-       endif
-       call calculate_Asap_Ktrunk (cc) ! Tree trunk conductance and sapwood area
+       ! Set up a new ring and move previous years' states inward
+       if(cc%DBH > cc%DBH_ys)then
+         cc%Nrings = cc%Nrings + 1 ! A new ring
+         if(cc%Nrings > Ysw_max)then
+            do j=2, Ysw_max
+               cc%WTC0(j-1)  = cc%WTC0(j)
+               cc%Kx(j-1)    = cc%Kx(j)
+               cc%farea(j-1) = cc%farea(j)
+               cc%accH(j-1)  = cc%accH(j)
+               cc%plcH(j-1)  = cc%plcH(j)
+               cc%Rring(j-1) = cc%Rring(j)
+               cc%Lring(j-1) = cc%Lring(j)
+               cc%Aring(j-1) = cc%Aring(j)
+            enddo
+         endif
+         k = MIN(cc%Nrings, Ysw_max)
+         ! WTC0 and Kx represent scientific hypotheses. They can be constant,
+         ! or functions of environmental conditions, growht rates, etc.
+         cc%WTC0(k) = NewWoodWTC(cc)
+         cc%Kx(k)   = NewWoodKx(cc)
+         ! Other cohort variables of the new ring
+         cc%farea(k) = 1.0
+         cc%accH(k)  = 0.0
+         cc%plcH(k)  = 0.0
+         cc%Rring(k) = cc%DBH/2.0
+         cc%Lring(k) = HT2Lpath(cc%height)
+         if(k>1)then
+            cc%Aring(k) = PI * Max(0.0,cc%Rring(k)**2 - (cc%DBH_ys/2.)**2)
+         else
+            cc%Aring(k) = PI * cc%Rring(k)**2 ! Only for the first year
+         endif
+         call calculate_Asap_Ktrunk (cc) ! Trunk conductance and sapwood area
+       endif ! Setup the new ring
+
+       ! Update hydrauolic usage in this year
        Lmax = HT2Lpath(cc%height) ! maxval(cc%Lring(:)) !
        cc%treeHU = 0.0
        cc%treeW0 = 0.0
@@ -1645,16 +1657,40 @@ subroutine vegn_hydraulic_states(vegn, deltat)
        enddo
        call calculate_Asap_Ktrunk (cc) ! Update Asap and Ktrunk
      end associate
-
-     ! ----- Conversion of sapwood to heartwood -----
-     call Sap2HeartWood_Hydro(cc)
-     !call Sap2HeartWood_fixedHv(cc)
-
-     ! Update other variables
-     call Update_hydraulic_vars(cc)
-     call Plant_water2psi_exp(cc)
   enddo
+#ifndef GrowthOFF
+     call vegn_SW2HW_hydro(vegn)
+#endif
+     call vegn_sum_tile(vegn)
 end subroutine vegn_hydraulic_states
+
+!========================================================================
+! 10/08/2023, for Mazen's Phloem transport model
+! Nakad et al. 2021. Journal of Fluid Mechanics
+! Taylor dispersion in osmotically driven laminar flows in phloem
+subroutine vegn_Phloem_transport(forcing,vegn)
+  ! for Mazen to build the phloem transport
+  ! step in seconds, step_seconds
+  type(climate_data_type),intent(in):: forcing
+  type(vegn_tile_type), intent(inout) :: vegn
+
+  ! ---- local vars
+  type(cohort_type), pointer :: cc => null()
+  type(spec_data_type),   pointer :: sp
+  real :: Lmax ! any variables here
+  real :: Tair
+  integer :: i, j, k
+
+  ! ------------------
+  tair = forcing%Tair -273.16   ! degC
+  do i = 1, vegn%n_cohorts
+     cc => vegn%cohorts(i)
+     associate ( sp => spdata(cc%species))
+       ! Phloem processes should be put here (Mazen Nakad)
+
+     end associate
+  enddo
+end subroutine vegn_Phloem_transport
 
 !========================================================================
 ! Weng 2022-03-29 ! Updated 01/13/2023
@@ -1762,6 +1798,95 @@ subroutine Plant_water_dynamics_linear(vegn)     ! forcing,
 
 end subroutine Plant_water_dynamics_linear
 
+!================================================================
+subroutine vegn_SW2HW_hydro(vegn)
+  ! Coverstion of sapwood to heartwood, yearly time step
+  ! Author: Ensheng Weng, 2023-10-08
+  type(vegn_tile_type), intent(inout) :: vegn
+
+  ! ---- local vars
+  type(cohort_type), pointer :: cc => null()
+  real :: D_hw, woodC, newSW, woodN, dSW
+  integer :: i
+
+  do i = 1, vegn%n_cohorts
+     cc => vegn%cohorts(i)
+     !call Sap2HeartWood_fixedHv(cc)
+     ! Woody plants only
+     associate (sp => spdata(cc%species) )
+     if(sp%lifeform>0)then
+       ! Calculate heartwood diameter
+       D_hw  = SQRT(Max(0.0, PI*(cc%DBH/2)**2 - cc%Asap)/PI)
+       woodC  = cc%bsw   + cc%bHW
+       woodN  = cc%sapwN + cc%woodN
+
+       ! Convert sapwood to heart wood
+       newSW = sp%alphaBM * (cc%dbh**sp%thetaBM - D_hw**sp%thetaBM)
+       dSW   = cc%bSW - newSW
+       cc%W_stem = cc%W_stem - cc%W_stem * dSW/cc%bSW
+       cc%W_dead = cc%W_dead + cc%W_stem * dSW/cc%bSW
+       cc%bHW    = cc%bHW + dSW
+       cc%bsw    = woodC - cc%bHW
+       cc%sapwN  = woodN * cc%bsw/woodC
+       cc%woodN  = woodN * cc%bHW/woodC
+     endif
+     end associate
+
+     ! Update other variables
+     call Update_cohort_vars(cc)
+     call Plant_water2psi_exp(cc)
+  enddo
+end subroutine vegn_SW2HW_hydro
+
+!--------------------------------------------------------------
+subroutine vegn_SW2HW_fixedHv(vegn)
+  ! Coverstion of sapwood to heartwood by fixed Hv, yearly time step
+  ! from LM3-PPA, Weng, 08-19-2022
+  type(vegn_tile_type), intent(inout) :: vegn
+
+  ! ---- local vars
+  type(cohort_type), pointer :: cc => null()
+  real :: CSAtot ! total cross section area, m2
+  real :: CSAsw  ! Sapwood cross sectional area, m2
+  real :: CSAwd  ! Heartwood cross sectional area, m2
+  real :: D_hw   ! diameter of heartwood at breast height, m
+  real :: BSWmax ! max sapwood biomass, kg C/individual
+  real :: dSW    ! Sapwood to Heartwood, kgC/individual
+  real :: dNS    ! Nitrogen from SW to HW
+  integer :: i
+
+  do i = 1, vegn%n_cohorts
+     cc => vegn%cohorts(i)
+     associate ( sp => spdata(cc%species) )
+       if(sp%lifeform>0)then ! woody plants
+          CSAsw  = cc%bl_max/sp%LMA * sp%phiCSA * cc%height
+          CSAtot = 0.25 * PI * cc%DBH**2
+          CSAwd  = max(0.0, CSAtot - CSAsw)
+          D_hw   = 2*sqrt(CSAwd/PI)
+          BSWmax = sp%alphaBM * (cc%DBH**sp%thetaBM - D_hw**sp%thetaBM)
+          dSW    = max(cc%bsw - BSWmax, 0.0)
+          dNS    = dSW/cc%bsw *cc%sapwN
+          ! update C and N of sapwood and wood
+          cc%bHW   = cc%bHW   + dSW
+          cc%bsw   = cc%bsw   - dSW
+          cc%sapwN = cc%sapwN - dNS
+          cc%woodN = cc%woodN + dNS
+          cc%W_stem = cc%W_stem - cc%W_stem * dSW/cc%bSW
+          cc%W_dead = cc%W_dead + cc%W_stem * dSW/cc%bSW
+
+          !Update Atrunk and Asap
+          D_hw = bm2dbh(cc%bHW,cc%species)
+          cc%Atrunk = PI*(cc%DBH/2)**2
+          cc%Asap = cc%Atrunk - PI*(D_hw/2)**2
+       endif
+     end associate
+
+     ! Update other variables
+     call Update_cohort_vars(cc)
+     call Plant_water2psi_exp(cc)
+  enddo
+end subroutine vegn_SW2HW_fixedHv
+
 !===================================================================
 real function PlantWaterSupply(cc,step_seconds) result(pws)
   !@sum: Calculate water supply for transpiration from plant water status
@@ -1846,82 +1971,8 @@ subroutine calculate_Asap_Ktrunk (cc)
 end subroutine calculate_Asap_Ktrunk
 
 !=================================================
-! Weng: Update C and N of sapwood and heartwood, 08/22/2022
-subroutine Sap2HeartWood_Hydro(cc)
-  type(cohort_type), intent(inout) :: cc
-  !----------local var ----------
-  real :: D_hw, woodC, newSW, woodN, dSW
-
-  ! Woody plants only
-  associate (sp => spdata(cc%species) )
-  if(sp%lifeform>0)then
-    ! Calculate heartwood diameter
-    D_hw  = SQRT(Max(0.0, PI*(cc%DBH/2)**2 - cc%Asap)/PI)
-    woodC  = cc%bsw   + cc%bHW
-    woodN  = cc%sapwN + cc%woodN
-
-    ! Convert sapwood to heart wood
-    newSW = sp%alphaBM * (cc%dbh**sp%thetaBM - D_hw**sp%thetaBM)
-    dSW   = cc%bSW - newSW
-    cc%W_stem = cc%W_stem - cc%W_stem * dSW/cc%bSW
-    cc%W_dead = cc%W_dead + cc%W_stem * dSW/cc%bSW
-    cc%bHW    = cc%bHW + dSW
-    cc%bsw    = woodC - cc%bHW
-    cc%sapwN  = woodN * cc%bsw/woodC
-    cc%woodN  = woodN * cc%bHW/woodC
-
-    !Update Atrunk and Asap
-    D_hw = bm2dbh(cc%bHW,cc%species)
-    cc%Atrunk = PI*(cc%DBH/2)**2
-    cc%Asap = cc%Atrunk - PI*(D_hw/2)**2
-  endif
-  end associate
-end subroutine Sap2HeartWood_Hydro
-
-!================================================================
-subroutine Sap2HeartWood_fixedHv(cc)
-  !@sum: Daily call for converting sapwood to heartwood with fixed Hv
-  !@+   added by Weng, 08-19-2022
-  implicit none
-  type(cohort_type), intent(inout) :: cc
-  !--- Local vars ------
-  real :: CSAtot ! total cross section area, m2
-  real :: CSAsw  ! Sapwood cross sectional area, m2
-  real :: CSAwd  ! Heartwood cross sectional area, m2
-  real :: D_hw   ! diameter of heartwood at breast height, m
-  real :: BSWmax ! max sapwood biomass, kg C/individual
-  real :: dSW    ! Sapwood to Heartwood, kgC/individual
-  real :: dNS    ! Nitrogen from SW to HW
-
-  !-------------------------
-  associate ( sp => spdata(cc%species) )
-    if(sp%lifeform>0)then ! woody plants
-       CSAsw  = cc%bl_max/sp%LMA * sp%phiCSA * cc%height ! with Plant hydraulics, Weng, 2016-11-30
-       CSAtot = 0.25 * PI * cc%DBH**2
-       CSAwd  = max(0.0, CSAtot - CSAsw)
-       D_hw  = 2*sqrt(CSAwd/PI)
-       BSWmax = sp%alphaBM * (cc%DBH**sp%thetaBM - D_hw**sp%thetaBM)
-       dSW   = max(cc%bsw - BSWmax, 0.0)
-       dNS    = dSW/cc%bsw *cc%sapwN
-       ! update C and N of sapwood and wood
-       cc%bHW   = cc%bHW   + dSW
-       cc%bsw   = cc%bsw   - dSW
-       cc%sapwN = cc%sapwN - dNS
-       cc%woodN = cc%woodN + dNS
-       cc%W_stem = cc%W_stem - cc%W_stem * dSW/cc%bSW
-       cc%W_dead = cc%W_dead + cc%W_stem * dSW/cc%bSW
-
-       !Update Atrunk and Asap
-       D_hw = bm2dbh(cc%bHW,cc%species)
-       cc%Atrunk = PI*(cc%DBH/2)**2
-       cc%Asap = cc%Atrunk - PI*(D_hw/2)**2
-    endif
-  end associate
-end subroutine Sap2HeartWood_fixedHv
-
-!=================================================
 ! Weng: update soil root area layers, hydraulic variables, 03/29/2022
-subroutine Update_hydraulic_vars(cc)
+subroutine Update_cohort_vars(cc)
   type(cohort_type), intent(inout) :: cc
   !----------local var ----------
   integer :: j
@@ -1939,7 +1990,7 @@ subroutine Update_hydraulic_vars(cc)
     cc%Wmin_l = cc%Wmax_l * exp(sp%psi0_LF*sp%CR_Leaf)
     cc%Wmin_s = cc%Wmax_s * exp(sp%psi0_WD*sp%CR_Wood)
   end associate
-end subroutine Update_hydraulic_vars
+end subroutine Update_cohort_vars
 
 !==============================================================================!
 !  SUBROUTINE: PSI2RWC
@@ -2075,7 +2126,7 @@ end function NewWoodKx
 !==============================================================
 !============= Vegetation initializations =====================
 subroutine initialize_vegn_tile(vegn)
-   type(vegn_tile_type),intent(inout),pointer :: vegn
+   type(vegn_tile_type),intent(inout) :: vegn
 
    !--------local vars -------
    type(cohort_type),dimension(:), pointer :: cc => null()
@@ -2123,7 +2174,7 @@ end subroutine initialize_vegn_tile
 !============================================================================
 !Weng, 12/20/2022, Reset to Initial Vegetation States
 subroutine reset_vegn_initial(vegn)
-   type(vegn_tile_type),intent(inout),pointer :: vegn
+   type(vegn_tile_type),intent(inout) :: vegn
 
    !--------local vars -------
    type(cohort_type),dimension(:), pointer :: cc1
@@ -2151,7 +2202,7 @@ end subroutine reset_vegn_initial
 
 !================================================================
 subroutine initialize_cohorts(vegn)
-   type(vegn_tile_type),intent(inout),pointer :: vegn
+   type(vegn_tile_type),intent(inout) :: vegn
 
    !--------local vars -------
    type(cohort_type),dimension(:), pointer :: cc
@@ -2183,7 +2234,7 @@ end subroutine initialize_cohorts
 
 !============================================================
 subroutine initialize_soil(vegn)
-   type(vegn_tile_type),intent(inout),pointer :: vegn
+   type(vegn_tile_type),intent(inout) :: vegn
 
    ! Initial Soil pools and environmental conditions
    vegn%SOC(4)    = init_fast_soil_C ! kgC m-2
@@ -2195,16 +2246,16 @@ subroutine initialize_soil(vegn)
    vegn%previousN = vegn%mineralN
    !Soil water
    vegn%soiltype = soiltype
-   vegn%FLDCAP   = FLDCAP
-   vegn%WILTPT   = WILTPT
-   vegn%wcl      = FLDCAP
+   vegn%FLDCAP   = soilpars(soiltype)%vwc_fc
+   vegn%WILTPT   = soilpars(soiltype)%vwc_wilt
+   vegn%wcl      = soilpars(soiltype)%vwc_sat
    vegn%thetaS   = 1.0
    call SoilWater_psi_K(vegn)
 end subroutine initialize_soil
 
 !=========================================================================
 subroutine initialize_vegn_random(vegn)
-   type(vegn_tile_type),intent(inout),pointer :: vegn
+   type(vegn_tile_type),intent(inout) :: vegn
    !--------local vars -------
    type(cohort_type),dimension(:), pointer :: cc
    type(cohort_type),pointer :: cp
@@ -2256,9 +2307,14 @@ subroutine initialize_cohort_from_biomass(cc,btot,psi_s0)
   associate(sp=>spdata(cc%species))
     call BM2Architecture(cc,btot)
     call update_max_LFR_NSN(cc)
-    cc%leafage = 0.0
-    cc%bl     = 0.0
-    cc%br     = cc%bl_max
+    if(sp%leafLS>1.0)then
+      cc%leafage = 1.0
+      cc%bl      = sp%LMA * sp%LAImax * cc%Acrown
+    else
+      cc%leafage = 0.0
+      cc%bl      = 0.0
+    endif
+    cc%br     = cc%br_max
     cc%nsc    = 2.0 * (cc%bl_max + cc%br_max)
     cc%seedC  = 0.0
 
@@ -2286,7 +2342,7 @@ subroutine initialize_cohort_from_biomass(cc,btot,psi_s0)
     ! Initial psi
     cc%psi_stem = psi_s0
     cc%psi_leaf = cc%psi_stem - HT2MPa(cc%height) ! MPa
-    call Update_hydraulic_vars(cc)
+    call Update_cohort_vars(cc)
     call plant_psi2water(cc)
 
   end associate
@@ -2445,7 +2501,6 @@ subroutine vegn_mergecohorts(vegn)
   ! ---- local vars
   type(cohort_type), pointer :: cc(:) ! array to hold new cohorts
   logical :: merged(vegn%n_cohorts)        ! mask to skip cohorts that were already merged
-  real, parameter :: mindensity = 1.0E-6
   integer :: i,j,k,m
 
   allocate(cc(vegn%n_cohorts))
@@ -2481,7 +2536,7 @@ subroutine kill_lowdensity_cohorts(vegn)
   ! ---- local vars
   type(cohort_type), pointer :: cp, cc(:) ! array to hold new cohorts
   logical :: merged(vegn%n_cohorts)        ! mask to skip cohorts that were already merged
-  real, parameter :: mindensity = 0.25E-4
+  real    :: mindensity = 0.5*min_nindivs
   integer :: i,j,k
 
  ! calculate the number of cohorts with indivs>mindensity
@@ -2489,10 +2544,6 @@ subroutine kill_lowdensity_cohorts(vegn)
   do i = 1, vegn%n_cohorts
      if (vegn%cohorts(i)%nindivs > mindensity) k=k+1
   enddo
-  if (k==0)then
-     write(*,*)'in kill_lowdensity_cohorts: All cohorts < mindensity, No action!'
-     !stop
-  endif
 
   ! exclude cohorts that have low individuals
   if (k>0 .and. k<vegn%n_cohorts)then
@@ -2500,7 +2551,6 @@ subroutine kill_lowdensity_cohorts(vegn)
      j=0
      do i = 1,vegn%n_cohorts
         cp =>vegn%cohorts(i)
-        associate(sp=>spdata(cp%species))
         if (cp%nindivs > mindensity) then
            j=j+1
            cc(j) = cp
@@ -2508,11 +2558,10 @@ subroutine kill_lowdensity_cohorts(vegn)
            ! Carbon and Nitrogen from plants to soil pools
            call plant2soil(vegn,cp,cp%nindivs)
         endif
-        end associate
      enddo
-     vegn%n_cohorts = j
      deallocate (vegn%cohorts)
      vegn%cohorts=>cc
+     vegn%n_cohorts = k
   endif
 end subroutine kill_lowdensity_cohorts
 
@@ -2525,7 +2574,6 @@ subroutine kill_old_grass(vegn)
   ! ---- local vars
   type(cohort_type), pointer :: cp, cc(:) ! array to hold new cohorts
   logical :: merged(vegn%n_cohorts)        ! mask to skip cohorts that were already merged
-  real, parameter :: mindensity = 0.25E-4
   logical :: OldGrass
   integer :: i,j,k
 
@@ -2612,7 +2660,7 @@ subroutine merge_cohorts(c1,c2) ! Put c1 into c2
      btot = c2%bsw + c2%bHW
      call BM2Architecture(c2,btot)
      call update_max_LFR_NSN(c2)
-     call Update_hydraulic_vars(c2)
+     call Update_cohort_vars(c2)
      call Plant_water2psi_exp(c2)
 
      ! Reset tree rings' hydraulics
@@ -2639,9 +2687,8 @@ end subroutine merge_cohorts
 ! ============================================================================
 function cohorts_can_be_merged(c1,c2); logical cohorts_can_be_merged
    type(cohort_type), intent(in) :: c1,c2
-
-   real, parameter :: mindensity = 1.0E-4
    logical :: sameSpecies,sameLayer,sameSize,sameSizeTree,sameSizeGrass
+   logical :: c1_LowDensity
 
    sameSpecies  = c1%species == c2%species
    sameLayer    = (c1%layer == c2%layer) .or. &
@@ -2656,7 +2703,9 @@ function cohorts_can_be_merged(c1,c2); logical cohorts_can_be_merged
                   (spdata(c2%species)%lifeform ==0) .and. &
                   (c1%DBH == c2%DBH)  ! it'll be always true for grasses
    sameSize = sameSizeTree .OR. sameSizeGrass
-   cohorts_can_be_merged = sameSpecies .and. sameLayer .and. sameSize
+   c1_LowDensity = c1%nindivs < min_nindivs
+   cohorts_can_be_merged = sameSpecies .and. sameLayer &
+                           .and. (sameSize .or. c1_LowDensity)
 end function
 
 !======================= Specific experiments ================================

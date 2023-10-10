@@ -18,8 +18,8 @@
  real, parameter :: mol_air = 28.96440e-3 ! molar mass of air, kg
  real, parameter :: mol_CO2 = 44.00995e-3 ! molar mass of CO2,kg
  real, parameter :: mol_h2o = 18.0e-3 ! molar mass of water, kg
- real, parameter :: cpair   = 1010.
- real, parameter :: H2OLv0  = 2.501e6   !latent heat H2O (J/kg)
+ real, parameter :: cpair   = 1010.     ! air heat capapcity (J/kg/K)
+ real, parameter :: H2OLv0  = 2.501e6   ! latent heat H2O (J/kg)
  real, parameter :: p_sea   = 101325.  ! atmospheric pressure  (Pa)
  real, parameter :: f_PAR   = 0.5  ! Fraction of PAR in total solar radiation
  real, parameter :: rad_phot = 0.0000046 ! PAR conversion factor of J -> mol of quanta
@@ -34,7 +34,7 @@
                        BAND_VIS = 1, & ! visible radiation (wavelenght range?)
                        BAND_NIR = 2    ! near infra-red radiation (wavelenght range?)
 
- real,    parameter :: min_nindivs= 1e-5 ! 2e-15 ! 1/m. 2e-15 is approximately 1 individual per Earth
+ real,    parameter :: min_nindivs= 0.5E-4 ! 2e-15 ! 1/m. 2e-15 is approximately 1 individual per Earth
 
  ! Plant hydraulics-mortality
  real, parameter    :: WDref0       = 300.0   ! Reference wood density, kgC m-3
@@ -47,16 +47,14 @@
  real, parameter :: CN0SOM(5) = (/50., 150., 10., 15., 40./) ! target CN ratios of SOM
  real, parameter :: CUEmax0 = 0.4 ! CN0fastSOC  = 15.0 ! 25.0 ! 15.0
 
- ! Soil water hydrualics
+ ! Soil water layers
  integer, parameter :: soil_L = 5 ! Soil layers, for soil water dynamics
- integer, parameter :: num_l   = soil_L ! Soil layers,
- real, parameter :: thksl(soil_L)=(/0.05,0.45,1.5,1.5,1.5/) ! m, thickness of soil layers
- real, parameter :: rzone = sum(thksl) !m
+ integer, parameter :: num_l  = soil_L ! Soil layers,
  real, parameter :: psi_wilt  = -150.0  ! matric head at wilting
  real, parameter :: K_rel_min = 1.e-12
- real, parameter :: rate_fc   = 0.1/86400 ! 0.1 mm/d drainage rate at FC
+ real, parameter :: rate_fc   = 0.1/86400 ! 0.1 mm/d threshold drainage rate at Field Capacity
  real, parameter :: ws0 = 0.02 ! hygroscopic point
- real, parameter :: Edepth = 0.05 !m, the depth of soil for surface evaporation
+ !real, parameter :: Edepth = 0.05 !m, the depth of soil for surface evaporation
  integer, parameter :: & ! soil types
               Sand        = 1,  LoamySand   = 2, &
               SandyLoam   = 3,  SiltLoam    = 4, &
@@ -118,7 +116,7 @@ type spec_data_type
   real :: gamma_FR     ! Fine root respiration rate, kgC kgC-1 yr-1
   real :: alpha_FR     ! Turnover rate of Fine roots, fraction yr-1
   real :: Kw_root      ! fine root water conductivity mol m m-2 s−1 Pa−1 !
-  real :: root_perm
+  real :: root_perm    ! assume it is a fraction of root area active for water flow
   !  real :: rho_N_up0   ! maximum N uptake rate
   !  real :: N_roots0    ! root biomass at half of max. N-uptake rate
   real :: NfixRate0    ! Reference N fixation rate (kgN kgC-1 root)
@@ -157,9 +155,9 @@ type spec_data_type
   real :: CNwood0
   real :: CNseed0
   ! phenology
-  real :: tc_crit_off    ! K, for turning OFF a growth season
-  real :: tc_crit_on     ! K, for turning ON a growth season
-  real :: gdd_crit       ! K, critical value of GDD5 for turning ON growth season
+  real :: tc_crit_off    ! C, for turning OFF a growth season
+  real :: tc_crit_on     ! C, for turning ON a growth season
+  real :: gdd_crit       ! C, critical value of GDD5 for turning ON growth season
   real :: gdd_par1
   real :: gdd_par2
   real :: gdd_par3
@@ -176,7 +174,8 @@ type spec_data_type
   real :: A_un         ! Parameter for understory mortality affected by layers
   real :: A_sd         ! Max multiplier for seedling mortality
   real :: B_sd         ! Mortality sensitivity for seedlings
-  real :: A_D          ! Sensitivity to dbh
+  real :: A_DBH        ! Max mulitplier for DBH-based mortality
+  real :: B_DBH        ! Sensitivity to dbh
   real :: s_hu         ! hydraulic mortality sensitivity
   ! Population level variables
   real :: LAImax    ! max. LAI
@@ -307,6 +306,7 @@ type :: cohort_type
   real :: WupL(soil_L) = 0.0 ! normalized vertical distribution of uptake
   real :: Q_soil(soil_L) = 0.0 ! Soil to roots water flux (kg H2O/tree/step)
   real :: W_supply  ! potential water uptake rate per unit time per tree
+  real :: totDemand  = 0.0 ! Total water demand in a growing season
   real :: transp   ! transpiration rate per tree per hour
   real :: uptake_frac(soil_L) ! for LM3 soil water uptake, Weng, 2017-10-28
   real :: K_r,r_r
@@ -489,23 +489,28 @@ type :: climate_data_type
 end type climate_data_type
 
 ! -------------------------------------------
-! Soil parameters
+! Soil water parameters
+integer :: soiltype = SandyLoam  ! 1 Sand; 2
+real :: WaterLeakRate = 0.0 ! Soil water leak rate, fraction per day
+real :: thksl(soil_L)=(/0.05,0.25,0.5,1.0,1.2/) ! m, thickness of soil layers
+
 ! Coarse  Medium   Fine    CM     CF     MF    CMF    Peat    MCM
-  real :: GMD(n_dim_soil_types) = & ! geometric mean partice diameter, mm
+real :: GMD(n_dim_soil_types) = & ! geometric mean partice diameter, mm
   (/ 0.7, 0.4, 0.3, 0.1, 0.1, 0.07, 0.007, 0.3, 0.3 /)
-  real :: GSD(n_dim_soil_types) = & ! geometric standard deviation of particle size
+real :: GSD(n_dim_soil_types) = & ! geometric standard deviation of particle size
   (/5.0, 5.3, 7.4, 6.1, 6.1, 14.0, 15.0, 7.4, 7.4 /)
-  real :: vwc_sat(n_dim_soil_types)= &
+real :: vwc_sat(n_dim_soil_types)= &
    (/ 0.380, 0.445, 0.448, 0.412, 0.414, 0.446, 0.424, 0.445, 0.445   /)
-  !real :: vlc_min(n_dim_soil_types)
-  real :: k_sat_ref(n_dim_soil_types)= & ! mol/(s MPa m) , hydraulic conductivity of saturated soil,
-  (/ 130.8, 75.1, 53.2, 12.1, 11.1, 12.7, 1.69, 53.2, 53.2 /)
-  real :: psi_sat_ref(n_dim_soil_types) = & ! Pa
+!real :: vlc_min(n_dim_soil_types)
+real :: k_sat_ref(n_dim_soil_types)= & ! mol/(s MPa m) , hydraulic conductivity of saturated soil,
+  (/ 70.8, 75.1, 28.2, 12.1, 11.1, 12.7, 1.69, 28.2, 28.2 /)
+  !(/ 130.8, 75.1, 53.2, 12.1, 11.1, 12.7, 1.69, 53.2, 53.2 /)
+real :: psi_sat_ref(n_dim_soil_types) = & ! Pa
   (/ -600., -790., -910., -1580., -1680., -1880., -5980., -790., -790./)
-  real :: chb(n_dim_soil_types) = &         ! Soil texture parameter
+real :: chb(n_dim_soil_types) = &         ! Soil texture parameter
   (/   3.5,   6.4,  11.0,   4.8,   6.3,   8.4,   6.3,   6.4,   6.4   /)
-  real :: alphaSoil(n_dim_soil_types) = 1.0       ! *** REPLACE LATER BY alpha(layer)
-  real :: heat_capacity_dry(n_dim_soil_types) = &
+real :: alphaSoil(n_dim_soil_types) = 1.0       ! *** REPLACE LATER BY alpha(layer)
+real :: heat_capacity_dry(n_dim_soil_types) = &
   (/ 1.2e6, 1.1e6, 1.1e6, 1.1e6, 1.1e6, 1.1e6, 1.1e6, 1.4e6,   1.0   /)
 
 ! -------------------------------------------
@@ -547,11 +552,13 @@ real :: plc_crit = 0.5     ! Critical value of plc for making a damage to xylems
 ! Mortality as a function of wood density
 real :: A_mort   = 0.2    ! mu = A_mort *exp(B_mort*WD/WDref)
 real :: B_mort   = -2.1
+real :: alphaDrought = 50.0 ! UFL: sensitivity of mortality to drought,
+                            ! infinite: no effect, 15: medium, 10: high
 
 ! Phenology parameters
 ! gdd_threshold = gdd_par1 + gdd_par2*exp(gdd_par3*ncd)
-real :: T0_gdd   = 273.15 + 5.0 ! 5.d0
-real :: T0_chill = 273.15 + 10.0
+real :: T0_gdd   = 5.0 ! 5.d0
+real :: T0_chill = 10.0
 integer :: N0_GD = 90 ! base growing days, 90 days, with a -5 substraction of Tc_crit
 
 ! Fire regimes
@@ -565,11 +572,6 @@ real :: r_BK0 = -240.0 ! -480.0  ! for bark resistance, exponential equation, 12
 real :: f_HT0 = 10.0 ! shape parameter fire resistence (due to growth of bark) as a function of height
 real :: h0_escape = 5.0 ! tree height that escapes direct burning of grass fires
 real :: D_BK0   = 5.9/1000.0 ! half survival bark thickness, m
-
-! Soil water properties
-real :: soiltype = SandyLoam  ! 1 Sand; 2
-real :: FLDCAP = 0.4  ! vol/vol
-real :: WILTPT = 0.05 ! vol/vol
 
 ! Soil organic matter decomposition
 real :: K0SOM(5)  = (/0.8, 0.25, 2.5, 2.0, 0.05/) ! turnover rate of SOM pools (yr-1)
@@ -600,7 +602,7 @@ real :: thetaCA(0:MSPECIES) = 1.5
 real :: thetaBM(0:MSPECIES) = 2.5
 real :: phiRL(0:MSPECIES)   = 3.5 ! ratio of fine root area to leaf area
 real :: phiCSA(0:MSPECIES)  = 0.25E-4 ! ratio of sapwood area to leaf area
-real :: tauNSC(0:MSPECIES)  = 3 ! 3 ! NSC residence time,years
+real :: tauNSC(0:MSPECIES)  = 6 ! 3 ! NSC residence time,years
 real :: fNSNmax(0:MSPECIES) = 5 ! 5 ! multiplier for NSNmax as sum of potential bl and br
 real :: transT(0:MSPECIES)  = 3 ! Years
 real :: f_cGap(0:MSPECIES)  = 0.1  ! The gaps between trees
@@ -610,14 +612,14 @@ real :: LFR_rate(0:MSPECIES)= 1.0
 real :: leaf_size(0:MSPECIES)= 0.04 !
 real :: LAImax(0:MSPECIES)   = 3.5    ! maximum LAI for a tree
 real :: LAI_light(0:MSPECIES)= 4.0    ! maximum LAI limited by light
-real :: LMA(0:MSPECIES)      = 0.035  !  leaf mass per unit area, kg C/m2
+real :: LMA(0:MSPECIES)      = 0.035  ! leaf mass per unit area, kg C/m2
 real :: leafLS(0:MSPECIES)   = 1.0
-real :: LNbase(0:MSPECIES)   = 0.8E-3 !functional nitrogen per unit leaf area, kg N/m2
+real :: LNbase(0:MSPECIES)   = 1.3E-3 !functional nitrogen per unit leaf area, kg N/m2, 1.1E-3 for Acer, 1.5E-3 for Populus
 real :: CN0leafST(0:MSPECIES)= 80.0 ! CN ratio of leaf supporting tissues
 
 ! photosynthesis parameters
 real :: Vmax(0:MSPECIES)= 35.0E-6 ! mol m-2 s-1
-real :: m_cond(0:MSPECIES)= 7.0 !
+real :: m_cond(0:MSPECIES)= 9.0 ! 7.0 !
 real :: alpha_ps(0:MSPECIES)=  0.06 !
 real :: Vannual(0:MSPECIES) = 1.2 ! kgC m-2 yr-1
 real :: ps_wet(0:MSPECIES) = 0.3 ! wet leaf photosynthesis down-regulation: 0.3 means
@@ -633,12 +635,14 @@ real :: alpha_FR(0:MSPECIES) = 1.2 ! Fine root turnover rate yr-1
 real :: rho_FR(0:MSPECIES) = 200 ! woody density, kgC m-3
 real :: root_r(0:MSPECIES) = 2.9E-4
 !(/1.1e-4, 1.1e-4, 2.9e-4, 2.9e-4, 2.9e-4, 2.9e-4, 2.9e-4, 2.9e-4, 2.9e-4, 2.9e-4, 2.9e-4, 2.9e-4, 1.1e-4, 1.1e-4, 2.2e-4, 2.2e-4/)
-real :: root_zeta(0:MSPECIES) = 0.29 !
-real :: Kw_root(0:MSPECIES)= 6.3E-8 * 1.e3 ! (kg m-2 s−1 MPa−1) ! Ref: 6.3±3.1×10−8 (m s−1 MPa−1)
+real :: root_zeta(0:MSPECIES) = 0.6 ! 0.29 !
+real :: root_perm(0:MSPECIES) = 0.5 ! kg H2O m-2 hour-1, defined by Weng
+real :: Kw_root(0:MSPECIES)   = 6.3E-8 * 1.e3 ! (kg m-2 s−1 MPa−1) ! Ref: 6.3±3.1×10−8 (m s−1 MPa−1)
 ! * (1000000.0/18.0)*1.e-6 ! mol /(s m2 Pa)
 !Ref added by Weng, 2021-11-15
-! Sutka et al. 2011 Natural Variation of Root Hydraulics in Arabidopsis Grown in Normal and Salt-Stressed Conditions.
-! Plant Physiol. 155(3): 1264–1276. doi: 10.1104/pp.110.163113
+! Sutka et al. 2011 Natural Variation of Root Hydraulics in Arabidopsis Grown
+! in Normal and Salt-Stressed Conditions. Plant Physiol. 155(3): 1264–1276.
+! doi: 10.1104/pp.110.163113
 ! Miyamoto et al. 2001. Hydraulic conductivity of rice roots. J. Exp. Bot., 52: 1835–1846,
 ! doi: 10.1093/jexbot/52.362.1835
 
@@ -653,8 +657,8 @@ real :: Kw_root(0:MSPECIES)= 6.3E-8 * 1.e3 ! (kg m-2 s−1 MPa−1) ! Ref: 6.3
 ! Respiration rates
 real :: gamma_L(0:MSPECIES)= 0.02 !
 real :: gamma_LN(0:MSPECIES)= 70.5 ! 25.0  ! kgC kgN-1 yr-1
-real :: gamma_SW(0:MSPECIES)= 0.08 ! 5.0e-4 ! kgC m-2 Acambium yr-1
-real :: gamma_FR(0:MSPECIES)= 12.0 ! 15 !kgC kgN-1 yr-1 ! 0.6: kgC kgN-1 yr-1
+real :: gamma_SW(0:MSPECIES)= 0.02 ! 0.08 ! kgC m-2 Acambium yr-1
+real :: gamma_FR(0:MSPECIES)= 0.6 ! 12 !kgC kgN-1 yr-1 ! 0.6: kgC kgN-1 yr-1
 
 ! Phenology parameters
 real :: tc_crit_off(0:MSPECIES)= 15. ! 283.16 ! OFF ! C for convenience
@@ -673,12 +677,13 @@ real :: prob_g(0:MSPECIES)   = 1.0
 real :: prob_e(0:MSPECIES)   = 1.0
 
 ! Mortality parameters
-real :: r0mort_c(0:MSPECIES) = 0.02 ! 0.01 ! yearly
-real :: D0mu(0:MSPECIES)     = 2.0     ! m, Mortality curve parameter
-real :: A_un(0:MSPECIES)     = 1.0     ! Multiplier for understory mortality
+real :: r0mort_c(0:MSPECIES) = 0.012 ! 0.01 ! yearly ! 0.012 for Acer, 0.0274 for Populus
+real :: D0mu(0:MSPECIES)     = 1.2     ! m, Mortality curve parameter
+real :: A_un(0:MSPECIES)     = 3.0     ! Multiplier for understory mortality
 real :: A_sd(0:MSPECIES)     = 9.0     ! Max multiplier for seedling mortality
 real :: B_sd(0:MSPECIES)     = -20.    ! Mortality sensitivity for seedlings
-real :: A_D(0:MSPECIES)      = 4.0   ! Sensitivity to dbh
+real :: A_DBH(0:MSPECIES)    = 4.0     ! Max multiplier for DBH-based mortality
+real :: B_DBH(0:MSPECIES)    = 0.125   ! 0.25   ! Size-based Mortality sensitivity, m
 real :: s_hu(0:MSPECIES)     = -25.0 ! hydraulic mortality sensitivity
 
 ! Plant hydraulics parameters
@@ -707,7 +712,7 @@ integer :: I
 integer, parameter :: N_IniCC_max = MSPECIES ! 5 ! Weng, 2014-10-01
 integer :: init_n_cohorts = N_IniCC_max
 integer :: init_cohort_species(N_IniCC_max) = (/ (I, I = 0, N_IniCC_max-1) /)
-real :: init_cohort_nindivs(N_IniCC_max) = 0.001  ! initial individual density, individual/m2
+real :: init_cohort_nindivs(N_IniCC_max) = 0.005  ! initial individual density, individual/m2
 real :: init_cohort_bl(N_IniCC_max)      = 0.0  ! initial biomass of leaves, kg C/individual
 real :: init_cohort_br(N_IniCC_max)      = 0.0  ! initial biomass of fine roots, kg C/individual
 real :: init_cohort_bsw(N_IniCC_max)     = 0.2  ! initial biomass of sapwood, kg C/individual
@@ -728,6 +733,7 @@ character(len=80) :: runID = 'test'
 character(len=160) :: climfile = 'ORNL_forcing.txt'
 integer  :: N_VegTile = 1 ! Initial vegn tiles
 integer  :: datalines ! the total lines in forcing data file
+integer  :: StartLine = 1 ! the first step model run start with, for UFL only
 integer  :: yr_data   ! Years of the forcing data
 integer  :: days_data ! days of the forcing data
 real     :: siteLAT = 36.01 !site latitude, ORNL
@@ -749,7 +755,7 @@ logical  :: do_U_shaped_mortality = .False.
 logical  :: update_annualLAImax = .False.
 logical  :: do_migration = .False.
 logical  :: do_fire = .False.
-logical  :: do_closedN_run = .True. !.False.
+logical  :: do_closedN_run = .False.
 logical  :: do_VariedKx   = .True. ! trunk new xylem has the same kx or not
 logical  :: do_VariedWTC0 = .True.
 logical  :: do_WD_mort_function = .False.
@@ -766,25 +772,26 @@ namelist /initial_state_nml/ &
     init_cohort_bHW, init_cohort_seedC, init_cohort_nsc,        &
     init_fast_soil_C, init_slow_soil_C, init_Nmineral, N_input, &
     ! Model run controls
-    filepath_in,filepath_out,runID,N_VegTile,climfile,siteLAT,  &
-    model_run_years, yr_ResetVeg, outputhourly, outputdaily,    &
+    filepath_in,filepath_out,runID,N_VegTile,climfile,StartLine,&
+    siteLAT,model_run_years,yr_ResetVeg,outputhourly,outputdaily,&
     do_U_shaped_mortality,update_annualLAImax, do_fire,         &
     do_migration, do_closedN_run, do_VariedKx, do_variedWTC0,   &
     do_WD_mort_function,Sc_prcp,CO2_c
 
 ! ---------- Soil hydraulic and heat parameter name list ---------
-namelist /soil_data_nml/ soiltype,             &
-     GMD, GSD, vwc_sat,k_sat_ref, psi_sat_ref, &
-     chb, alphaSoil,heat_capacity_dry
+namelist /soil_data_nml/ soiltype,WaterLeakRate,thksl,  &
+     GMD, GSD, vwc_sat, k_sat_ref, psi_sat_ref, chb,    &
+     alphaSoil,heat_capacity_dry
 
 ! --------- Vegetation parameter name list ---------
-namelist /vegn_parameters_nml/  diff_S0,                              &
+namelist /vegn_parameters_nml/  diff_S0, alphaDrought,                &
   pt, phenotype, lifeform,                                            &
   alphaHT,alphaCA,alphaBM,thetaHT,thetaCA,thetaBM,f_taper,f_cGap,     &
   ! Leaf
   LAImax,LAI_light,LMA,Vmax,m_cond,Vannual,ps_wet,c_LLS,leaf_size,    &
   ! Wood and root
-  rho_wood,rho_FR,root_r,root_zeta,Kw_root,rho_N_up0, N_roots0,       &
+  rho_wood,rho_FR,root_r,root_zeta,root_perm, Kw_root,                &
+  rho_N_up0, N_roots0,                                                &
   ! Growth & respiration
   f_iniBSW,f_LFR_max,GR_factor,LFR_rate,tauNSC,phiRL,phiCSA,          &
   NfixRate0, NfixCost0,f_N_add,fNSNmax,transT, l_fract,               &
@@ -794,7 +801,7 @@ namelist /vegn_parameters_nml/  diff_S0,                              &
   T0_gdd,T0_chill,gdd_par1,gdd_par2,gdd_par3,                         &
   ! Reproduction and Mortality
   AgeRepro,v_seed,s0_plant,prob_g,prob_e,                             &
-  r0mort_c,D0mu,A_un,A_sd,B_sd,A_mort,B_mort,A_D,s_hu,                &
+  r0mort_c,D0mu,A_un,A_sd,B_sd,A_mort,B_mort,A_DBH, B_DBH,s_hu,       &
   ! Tisue C/N ratios
   LNbase,CN0leafST,CNleaf0,CNsw0,CNwood0,CNroot0,CNseed0,             &
   ! Plant hydraulics
@@ -802,7 +809,7 @@ namelist /vegn_parameters_nml/  diff_S0,                              &
   TK0_leaf,kx0, WTC0, psi0_LF,psi0_osm,r_DF,m0_WTC,m0_kx,             &
   fplc0_WD,A_plc0_WD,f_plc,plc_crit,                                  &
   ! Soil
-  FLDCAP,WILTPT,LMAmin,fsc_fine,fsc_wood,                             &
+  LMAmin,fsc_fine,fsc_wood,                             &
   K0SOM,K_nitrogen,rho_SON,f_M2SOM,fDON,etaN,                         &
   ! Fire model parameters, Weng, 01/13/2021
   envi_fire_prb,Ignition_G0, Ignition_W0,m0_w_fire, m0_g_fire, r_BK0, &
@@ -834,11 +841,20 @@ subroutine initialize_soilpars()
   ! ---- derived constant soil parameters
   ! w_fc (field capacity) set to w at which hydraulic conductivity equals
   ! a nominal drainage rate "rate_fc". w_wilt set to w at which psi is psi_wilt
-  soilpars%vwc_wilt = soilpars%vwc_sat &
-          *(soilpars%psi_sat_ref/(psi_wilt*soilpars%alpha))**(1/soilpars%chb)
-  soilpars%vwc_fc = soilpars%vwc_sat &
-              *(rate_fc/(soilpars%k_sat_ref*soilpars%alpha**2))**(1/(3+2*soilpars%chb))
+  soilpars%vwc_fc = soilpars%vwc_sat !&
+          !*(rate_fc/(soilpars%k_sat_ref*soilpars%alpha**2))**(1/(3+2*soilpars%chb))
+  soilpars%vwc_wilt = soilpars%vwc_sat *0.12 !&
+          !*(soilpars%psi_sat_ref/(psi_wilt*soilpars%alpha))**(1/soilpars%chb)
   soilpars%vlc_min = soilpars%vwc_sat*K_rel_min**(1/(3+2*soilpars%chb))
+
+ ! Original LM3PPA codes
+ !  soil%w_wilt(:) = soil%pars%vwc_sat &
+ !       *(soil%pars%psi_sat_ref/(psi_wilt*soil%pars%alpha))**(1/soil%pars%chb)
+ !  soil%w_fc  (:) = soil%pars%vwc_sat &
+ !       *(rate_fc/(soil%pars%k_sat_ref*soil%pars%alpha**2))**(1/(3+2*soil%pars%chb))
+ !  soil%pars%vwc_wilt = soil%w_wilt(1)
+ !  soil%pars%vwc_fc   = soil%w_fc  (1)
+ !  soil%pars%vlc_min = soil%pars%vwc_sat*K_rel_min**(1/(3+2*soil%pars%chb))
 
 end subroutine initialize_soilpars
 
@@ -865,13 +881,14 @@ subroutine initialize_PFT_data()
   spdata%rho_FR   = rho_FR
   spdata%root_r   = root_r
   spdata%root_zeta= root_zeta
+  spdata%root_perm= root_perm
   spdata%Kw_root  = Kw_root
   !  spdata%rho_N_up0 = rho_N_up0
   !  spdata%N_roots0  = N_roots0
 
   ! Phenology
-  spdata%tc_crit_off = 273.15 + tc_crit_off ! C to K
-  spdata%tc_crit_on  = 273.15 + tc_crit_on  ! C to K
+  spdata%tc_crit_off = tc_crit_off ! C
+  spdata%tc_crit_on  = tc_crit_on  ! C
   spdata%gdd_crit    = gdd_crit
   spdata%gdd_par1    = gdd_par1
   spdata%gdd_par2    = gdd_par2
@@ -902,7 +919,8 @@ subroutine initialize_PFT_data()
   spdata%A_un     = A_un
   spdata%A_sd     = A_sd
   spdata%B_sd     = B_sd
-  spdata%A_D      = A_D
+  spdata%A_DBH    = A_DBH
+  spdata%B_DBH    = B_DBH
   spdata%s_hu     = s_hu
   spdata%rho_wood = rho_wood
   spdata%f_taper  = f_taper
@@ -1098,6 +1116,9 @@ end subroutine qscomp
 
    associate(sp=>spdata(cc%species))
      BLmax = sp%LMA  * sp%LAImax * cc%Acrown * (1.0-sp%f_cGap)/max(1,cc%layer)
+#ifdef UFL_test
+     if(cc%layer > 1) BLmax = sp%LMA  * 1.0 * cc%Acrown * (1.0-sp%f_cGap)
+#endif
    end associate
  end function
 
@@ -1108,6 +1129,9 @@ function BLmax2BRmax(cc) result (BRmax)
 
   associate(sp=>spdata(cc%species))
     BRmax = sp%phiRL*cc%bl_max/(sp%LMA*sp%SRA)
+#ifdef UFL_test
+    if(cc%layer > 1) BRmax = 0.5*cc%bl_max/(sp%LMA*sp%SRA)
+#endif
   end associate
 end function
 
